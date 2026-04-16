@@ -4,7 +4,7 @@
 # Dependencies: sing-box, iproute2
 # Usage: sudo proxy-shell <host:port> [command]
 #
-NS="vpn-$$"
+NS="psh-$$"
 TUN_DEV="tun$$"
 TUN_GW="198.18.0.1"         # TUN interface IP inside the namespace
 FAKE_RANGE="198.18.0.0/15"  # Fake IP range for DNS fakeip
@@ -159,9 +159,9 @@ setup() {
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo " VPN shell active"
+    echo " Proxified shell active"
     echo " SOCKS5 proxy : ${PROXY_HOST}:${PROXY_PORT}"
-    echo " DNS          : automatic (resolved by remote proxy)"
+    echo " DNS          : resolved by remote proxy"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -240,6 +240,16 @@ fi
 
 shift  # remove host:port from "$@"; remaining args are the optional command
 
+# Clean up orphaned /etc/netns entries from previous crashed instances
+for dir in /etc/netns/psh-*/; do
+    ns="${dir%/}"
+    ns="${ns##*/}"
+    if ! ip netns list | grep -q "^${ns} "; then
+        rm -f "${dir}resolv.conf"
+        rmdir "$dir" 2>/dev/null || true
+    fi
+done
+
 check_deps
 
 trap teardown EXIT
@@ -250,7 +260,7 @@ if [ $# -eq 0 ]; then
     cat > "$RCFILE" <<'RCEOF'
 force_color_prompt=yes
 [ -f ~/.bashrc ] && source ~/.bashrc
-PS1='\[\e[38;5;232m\]\[\e[48;5;82m\] proxified \[\e[0m\]\[\e[38;5;82m\]❯\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \$ '
+PS1='\[\e[38;5;232m\]\[\e[48;5;82m\] proxy-shell \[\e[0m\]\[\e[38;5;82m\]❯\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \$ '
 RCEOF
     chown "$SUDO_USER" "$RCFILE"
     ip netns exec "$NS" sudo -u "$SUDO_USER" \

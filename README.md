@@ -68,7 +68,7 @@ sudo proxy-shell 127.0.0.1:8888
 Your prompt will change to indicate you are inside a proxified environment:
 
 ```
- proxified ❯ ~ $
+ proxy-shell ❯ ~ $
 ```
 
 Every command you run from this shell will have its traffic routed through the proxy. Exit the shell normally (`exit` or Ctrl+D) to tear everything down.
@@ -93,9 +93,9 @@ ssh -D 8888 -N user@jumphost &
 sudo proxy-shell 127.0.0.1:8888
 
 # Everything you run inside resolves and connects through the tunnel
- proxified ❯ ~ $ curl https://internal.corp.example
- proxified ❯ ~ $ nmap -sT internal-host
- proxified ❯ ~ $ git clone https://internal-git.corp.example/repo.git
+ proxy-shell ❯ ~ $ curl https://internal.corp.example
+ proxy-shell ❯ ~ $ nmap -sT internal-host
+ proxy-shell ❯ ~ $ git clone https://internal-git.corp.example/repo.git
 ```
 
 ### Multiple simultaneous sessions

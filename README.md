@@ -1,6 +1,6 @@
 # proxy-shell
 
-An isolated shell where **all TCP traffic is transparently routed through a SOCKS5 proxy** — including DNS, which is automatically resolved through the remote proxy without any manual configuration.
+An isolated shell where **all network traffic is transparently routed through a SOCKS5 proxy** — including DNS, which is automatically resolved through the remote proxy without any manual configuration.
 
 Typical use case: you have a SOCKS5 proxy available (e.g. a corporate proxy, a Tor instance, an SSH tunnel, or any other) and you want every tool you run — `curl`, `nmap`, `git`, custom scripts — to go through it without touching each tool's settings.
 
@@ -8,7 +8,7 @@ Typical use case: you have a SOCKS5 proxy available (e.g. a corporate proxy, a T
 
 `proxy-shell` uses Linux **network namespaces** and a **TUN interface** powered by [sing-box](https://github.com/SagerNet/sing-box) to create a fully isolated network environment. Inside that environment:
 
-- All TCP connections are transparently forwarded through your SOCKS5 proxy.
+- All network traffic is transparently forwarded through your SOCKS5 proxy.
 - DNS queries are intercepted and resolved by the remote proxy using a **fake IP** strategy — the same technique used by tools like Burp Suite's "Use SOCKS proxy for DNS lookups". No DNS leaks, no need to find or configure a remote DNS server.
 - The isolation is enforced at the kernel level. There is no per-process configuration, no `LD_PRELOAD` hooking, no `ptrace`. It works with statically linked binaries, Go programs, Rust tools — anything.
 

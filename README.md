@@ -40,6 +40,7 @@ Missing dependencies are detected automatically at startup, with an option to in
 Make `proxy-shell` available system-wide:
 
 ```bash
+chmod +x proxy-shell
 sudo ./proxy-shell --global-install
 ```
 

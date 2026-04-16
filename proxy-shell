@@ -1,0 +1,261 @@
+#!/bin/bash
+# proxy-shell: isolated shell where ALL TCP traffic is routed through a SOCKS5 proxy
+# DNS resolved automatically by the remote proxy — no manual configuration needed
+# Dependencies: sing-box, iproute2
+# Usage: sudo proxy-shell <host:port> [command]
+#
+NS="vpn-$$"
+TUN_DEV="tun$$"
+TUN_GW="198.18.0.1"         # TUN interface IP inside the namespace
+FAKE_RANGE="198.18.0.0/15"  # Fake IP range for DNS fakeip
+PID_FILE="/tmp/singbox-${$}.pid"
+LOG_FILE="/tmp/singbox-${$}.log"
+CONF_FILE="/tmp/singbox-${$}.json"
+RCFILE="/tmp/proxy-shell-rc-${$}"
+
+set -e
+
+# ── Dependency check ────────────────────────────────────────────────────────
+
+install_singbox() {
+    echo "[*] Downloading sing-box..."
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch="amd64"  ;;
+        aarch64) arch="arm64"  ;;
+        armv7l)  arch="armv7"  ;;
+        *) echo "[!] Unsupported architecture: $(uname -m)"; exit 1 ;;
+    esac
+
+    local version
+    version=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
+              | grep '"tag_name"' | cut -d'"' -f4)
+    local ver="${version#v}"
+    local url="https://github.com/SagerNet/sing-box/releases/download/${version}/sing-box-${ver}-linux-${arch}.tar.gz"
+
+    local tmp
+    tmp=$(mktemp -d)
+    curl -fsSL "$url" | tar -xz -C "$tmp"
+    install -m 755 "$tmp"/sing-box-*/sing-box /usr/local/bin/sing-box
+    rm -rf "$tmp"
+    echo "[*] sing-box ${version} installed."
+}
+
+check_deps() {
+    local missing=()
+
+    command -v ip       &>/dev/null || missing+=("iproute2")
+    command -v sing-box &>/dev/null || missing+=("sing-box")
+    command -v curl     &>/dev/null || missing+=("curl")
+
+    [ ${#missing[@]} -eq 0 ] && return 0
+
+    echo ""
+    echo "  Missing dependencies: ${missing[*]}"
+    echo ""
+    read -r -p "  Install now? [y/N] " answer </dev/tty
+    [[ "$answer" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+    echo ""
+
+    for dep in "${missing[@]}"; do
+        case "$dep" in
+            iproute2|curl)
+                echo "[*] Installing ${dep}..."
+                apt-get install -y "$dep" -qq
+                ;;
+            sing-box)
+                install_singbox
+                ;;
+        esac
+    done
+}
+
+# ── Global install ──────────────────────────────────────────────────────────
+
+global_install() {
+    local target="/usr/local/bin/proxy-shell"
+    local script
+    script="$(realpath "$0")"
+
+    if [ "$script" = "$target" ]; then
+        echo "[!] Already running from ${target}, nothing to do."
+        exit 0
+    fi
+
+    echo "[*] Installing proxy-shell to ${target}..."
+    install -m 755 "$script" "$target"
+    echo "[*] Done. You can now run: sudo proxy-shell"
+
+    echo ""
+    check_deps
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+generate_config() {
+    local prefix="${FAKE_RANGE##*/}"
+    printf '{
+  "log": {"level": "warn"},
+  "dns": {
+    "servers": [
+      {"tag": "fp",     "type": "fakeip", "inet4_range": "%s"},
+      {"tag": "remote", "type": "tcp",    "server": "8.8.8.8", "detour": "proxy"}
+    ],
+    "rules": [{"query_type": ["A", "AAAA"], "server": "fp"}],
+    "final": "remote"
+  },
+  "inbounds": [{
+    "type": "tun",
+    "interface_name": "%s",
+    "address": ["%s/%s"],
+    "mtu": 9000,
+    "auto_route": false,
+    "stack": "gvisor"
+  }],
+  "outbounds": [{
+    "type": "socks",
+    "tag": "proxy",
+    "server": "%s",
+    "server_port": %s,
+    "version": "5"
+  }],
+  "route": {
+    "rules": [{"port": 53, "action": "hijack-dns"}],
+    "final": "proxy"
+  }
+}\n' "$FAKE_RANGE" "$TUN_DEV" "$TUN_GW" "$prefix" "$PROXY_HOST" "$PROXY_PORT" > "$CONF_FILE"
+}
+
+setup() {
+    echo "[*] Creating network namespace..."
+    ip netns add "$NS"
+
+    echo "[*] Starting sing-box..."
+    generate_config
+    # sing-box runs in the HOST namespace: direct access to 127.0.0.1:PROXY_PORT
+    sing-box run -c "$CONF_FILE" &>"$LOG_FILE" &
+    echo $! > "$PID_FILE"
+
+    sleep 1
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "[!] sing-box failed to start:"
+        cat "$LOG_FILE"
+        exit 1
+    fi
+
+    echo "[*] Moving TUN into vpn namespace..."
+    # sing-box keeps its fd valid even after the interface moves to another namespace
+    ip link set "$TUN_DEV" netns "$NS"
+    ip netns exec "$NS" ip addr add "${TUN_GW}/15" dev "$TUN_DEV"
+    ip netns exec "$NS" ip link set "$TUN_DEV" up
+    ip netns exec "$NS" ip link set lo up
+    ip netns exec "$NS" ip route add default dev "$TUN_DEV"
+
+    echo "[*] Configuring namespace DNS..."
+    mkdir -p /etc/netns/"$NS"
+    # 8.8.8.8 never receives anything: sing-box intercepts all DNS via fake IP
+    # and delegates resolution to the remote SSH proxy
+    echo "nameserver 8.8.8.8" > /etc/netns/"$NS"/resolv.conf
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo " VPN shell active"
+    echo " SOCKS5 proxy : ${PROXY_HOST}:${PROXY_PORT}"
+    echo " DNS          : automatic (resolved by remote proxy)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+teardown() {
+    echo ""
+    echo "[*] Cleaning up..."
+    kill "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null || true
+    ip netns del "$NS" 2>/dev/null || true
+    ip link del "$TUN_DEV" 2>/dev/null || true
+    rm -f "$PID_FILE" "$LOG_FILE" "$CONF_FILE" "$RCFILE"
+    rm -f /etc/netns/"$NS"/resolv.conf
+    rmdir /etc/netns/"$NS" 2>/dev/null || true
+    echo "[*] Done."
+}
+
+usage() {
+    echo "Usage: sudo proxy-shell <host:port> [command]"
+    echo ""
+    echo "  host:port   SOCKS5 proxy address (e.g. 127.0.0.1:8888)"
+    echo "  command     Optional command to run inside the proxified namespace."
+    echo "              If omitted, opens an interactive shell — ALL traffic from"
+    echo "              every command you run will be transparently proxified."
+    echo ""
+    echo "  --global-install   Copy this script to /usr/local/bin and check dependencies."
+    echo ""
+    echo "Examples:"
+    echo "  # Open a proxified interactive shell:"
+    echo "  sudo proxy-shell 127.0.0.1:8888"
+    echo ""
+    echo "  # Run a single command through the proxy:"
+    echo "  sudo proxy-shell 127.0.0.1:8888 curl https://ifconfig.me"
+    exit 1
+}
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+if [ "$EUID" -ne 0 ]; then
+    echo "[!] This script must be run as root."
+    echo "    Try: sudo $0 $*"
+    exit 1
+fi
+
+if [ "${1:-}" = "--global-install" ]; then
+    global_install
+    exit 0
+fi
+
+# Parse host:port
+PROXY_ADDR="${1}"
+PROXY_HOST="${PROXY_ADDR%%:*}"
+PROXY_PORT="${PROXY_ADDR##*:}"
+
+if [ -z "$PROXY_HOST" ] || [ -z "$PROXY_PORT" ] || [ "$PROXY_HOST" = "$PROXY_ADDR" ]; then
+    echo "[!] Invalid proxy address: '${PROXY_ADDR}' — expected host:port"
+    echo ""
+    usage
+fi
+
+if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] || [ "$PROXY_PORT" -lt 1 ] || [ "$PROXY_PORT" -gt 65535 ]; then
+    echo "[!] Invalid port: '${PROXY_PORT}' — must be a number between 1 and 65535"
+    echo ""
+    usage
+fi
+
+# Resolve hostname to IP — sing-box requires a numeric address for outbound servers
+if ! [[ "$PROXY_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    RESOLVED=$(getent hosts "$PROXY_HOST" 2>/dev/null | awk '{print $1; exit}')
+    if [ -z "$RESOLVED" ]; then
+        echo "[!] Could not resolve hostname: '${PROXY_HOST}'"
+        exit 1
+    fi
+    PROXY_HOST="$RESOLVED"
+fi
+
+shift  # remove host:port from "$@"; remaining args are the optional command
+
+check_deps
+
+trap teardown EXIT
+
+setup
+
+if [ $# -eq 0 ]; then
+    cat > "$RCFILE" <<'RCEOF'
+force_color_prompt=yes
+[ -f ~/.bashrc ] && source ~/.bashrc
+PS1='\[\e[38;5;232m\]\[\e[48;5;82m\] proxified \[\e[0m\]\[\e[38;5;82m\]❯\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \$ '
+RCEOF
+    chown "$SUDO_USER" "$RCFILE"
+    ip netns exec "$NS" sudo -u "$SUDO_USER" \
+        env TERM="${TERM:-xterm-256color}" \
+        bash --rcfile "$RCFILE"
+else
+    ip netns exec "$NS" sudo -u "$SUDO_USER" "$@"
+fi

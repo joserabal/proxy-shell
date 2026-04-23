@@ -1,8 +1,7 @@
 #!/bin/bash
-# proxy-shell: isolated shell where ALL TCP traffic is routed through a SOCKS5 proxy
-# DNS resolved automatically by the remote proxy — no manual configuration needed
+# proxy-shell: isolated shell where ALL traffic is routed through a SOCKS5 proxy
 # Dependencies: sing-box, iproute2
-# Usage: sudo proxy-shell <host:port> [command]
+# Usage: sudo proxy-shell [options] <host:port> [command]
 #
 NS="psh-$$"
 TUN_DEV="tun$$"
@@ -12,6 +11,8 @@ PID_FILE="/tmp/singbox-${$}.pid"
 LOG_FILE="/tmp/singbox-${$}.log"
 CONF_FILE="/tmp/singbox-${$}.json"
 RCFILE="/tmp/proxy-shell-rc-${$}"
+PROXY_DNS=""                 # --dns: comma-separated DNS servers to use through proxy
+LOCAL_DNS=0                  # --local-dns: resolve DNS locally, not through proxy
 
 set -e
 
@@ -90,15 +91,18 @@ global_install() {
     check_deps
 }
 
-# ── Main ────────────────────────────────────────────────────────────────────
+# ── Config generation ────────────────────────────────────────────────────────
 
-generate_config() {
-    local prefix="${FAKE_RANGE##*/}"
-    printf '{
+# Default mode: fake IP DNS — hostnames resolved by the remote proxy.
+# Tools see fake IPs (198.18.0.0/15), not real ones.
+_gen_fakeip_config() {
+    local prefix="$1"
+    cat > "$CONF_FILE" <<EOF
+{
   "log": {"level": "warn"},
   "dns": {
     "servers": [
-      {"tag": "fp",     "type": "fakeip", "inet4_range": "%s"},
+      {"tag": "fp",     "type": "fakeip", "inet4_range": "${FAKE_RANGE}"},
       {"tag": "remote", "type": "tcp",    "server": "8.8.8.8", "detour": "proxy"}
     ],
     "rules": [{"query_type": ["A", "AAAA"], "server": "fp"}],
@@ -106,8 +110,8 @@ generate_config() {
   },
   "inbounds": [{
     "type": "tun",
-    "interface_name": "%s",
-    "address": ["%s/%s"],
+    "interface_name": "${TUN_DEV}",
+    "address": ["${TUN_GW}/${prefix}"],
     "mtu": 9000,
     "auto_route": false,
     "stack": "gvisor"
@@ -115,16 +119,118 @@ generate_config() {
   "outbounds": [{
     "type": "socks",
     "tag": "proxy",
-    "server": "%s",
-    "server_port": %s,
+    "server": "${PROXY_HOST}",
+    "server_port": ${PROXY_PORT},
     "version": "5"
   }],
   "route": {
     "rules": [{"port": 53, "action": "hijack-dns"}],
     "final": "proxy"
   }
-}\n' "$FAKE_RANGE" "$TUN_DEV" "$TUN_GW" "$prefix" "$PROXY_HOST" "$PROXY_PORT" > "$CONF_FILE"
 }
+EOF
+}
+
+# --dns mode: DNS resolved via specified servers, routed through the proxy.
+# Tools see real IPs. Requires a DNS server reachable through the proxy
+# that knows about the target hostnames (e.g. an internal corporate DNS).
+_gen_proxy_dns_config() {
+    local prefix="$1"
+
+    # Build JSON server entries from comma-separated PROXY_DNS list
+    local servers_json=""
+    local i=0
+    IFS=',' read -ra dns_list <<< "$PROXY_DNS"
+    for srv in "${dns_list[@]}"; do
+        srv="${srv// /}"
+        [ $i -gt 0 ] && servers_json+=$',\n      '
+        servers_json+="{\"tag\": \"remote-${i}\", \"type\": \"tcp\", \"server\": \"${srv}\", \"detour\": \"proxy\"}"
+        ((i++)) || true
+    done
+
+    cat > "$CONF_FILE" <<EOF
+{
+  "log": {"level": "warn"},
+  "dns": {
+    "servers": [
+      ${servers_json}
+    ],
+    "rules": [{"query_type": ["A", "AAAA"], "server": "remote-0"}],
+    "final": "remote-0"
+  },
+  "inbounds": [{
+    "type": "tun",
+    "interface_name": "${TUN_DEV}",
+    "address": ["${TUN_GW}/${prefix}"],
+    "mtu": 9000,
+    "auto_route": false,
+    "stack": "gvisor"
+  }],
+  "outbounds": [{
+    "type": "socks",
+    "tag": "proxy",
+    "server": "${PROXY_HOST}",
+    "server_port": ${PROXY_PORT},
+    "version": "5"
+  }],
+  "route": {
+    "rules": [{"port": 53, "action": "hijack-dns"}],
+    "final": "proxy"
+  }
+}
+EOF
+}
+
+# --local-dns mode: DNS resolved by the local machine's resolver (not through proxy).
+# Tools see real IPs. DNS queries are not tunneled — may leak to local network.
+_gen_local_dns_config() {
+    local prefix="$1"
+
+    cat > "$CONF_FILE" <<EOF
+{
+  "log": {"level": "warn"},
+  "dns": {
+    "servers": [
+      {"tag": "local", "type": "local"}
+    ],
+    "rules": [{"query_type": ["A", "AAAA"], "server": "local"}],
+    "final": "local"
+  },
+  "inbounds": [{
+    "type": "tun",
+    "interface_name": "${TUN_DEV}",
+    "address": ["${TUN_GW}/${prefix}"],
+    "mtu": 9000,
+    "auto_route": false,
+    "stack": "gvisor"
+  }],
+  "outbounds": [{
+    "type": "socks",
+    "tag": "proxy",
+    "server": "${PROXY_HOST}",
+    "server_port": ${PROXY_PORT},
+    "version": "5"
+  }],
+  "route": {
+    "rules": [{"port": 53, "action": "hijack-dns"}],
+    "final": "proxy"
+  }
+}
+EOF
+}
+
+generate_config() {
+    local prefix="${FAKE_RANGE##*/}"
+    if [ -n "$PROXY_DNS" ]; then
+        _gen_proxy_dns_config "$prefix"
+    elif [ "$LOCAL_DNS" -eq 1 ]; then
+        _gen_local_dns_config "$prefix"
+    else
+        _gen_fakeip_config "$prefix"
+    fi
+}
+
+# ── Setup / teardown ─────────────────────────────────────────────────────────
 
 setup() {
     echo "[*] Creating network namespace..."
@@ -132,7 +238,7 @@ setup() {
 
     echo "[*] Starting sing-box..."
     generate_config
-    # sing-box runs in the HOST namespace: direct access to 127.0.0.1:PROXY_PORT
+    # sing-box runs in the HOST namespace: direct access to PROXY_HOST:PROXY_PORT
     sing-box run -c "$CONF_FILE" &>"$LOG_FILE" &
     echo $! > "$PID_FILE"
 
@@ -143,7 +249,7 @@ setup() {
         exit 1
     fi
 
-    echo "[*] Moving TUN into vpn namespace..."
+    echo "[*] Moving TUN into proxy namespace..."
     # sing-box keeps its fd valid even after the interface moves to another namespace
     ip link set "$TUN_DEV" netns "$NS"
     ip netns exec "$NS" ip addr add "${TUN_GW}/15" dev "$TUN_DEV"
@@ -153,15 +259,23 @@ setup() {
 
     echo "[*] Configuring namespace DNS..."
     mkdir -p /etc/netns/"$NS"
-    # 8.8.8.8 never receives anything: sing-box intercepts all DNS via fake IP
-    # and delegates resolution to the remote SSH proxy
+    # Placeholder — sing-box intercepts all DNS on port 53 before it leaves the namespace
     echo "nameserver 8.8.8.8" > /etc/netns/"$NS"/resolv.conf
+
+    local dns_label
+    if [ -n "$PROXY_DNS" ]; then
+        dns_label="real IPs via proxy (${PROXY_DNS})"
+    elif [ "$LOCAL_DNS" -eq 1 ]; then
+        dns_label="real IPs via local resolver (not tunneled)"
+    else
+        dns_label="fake IP — resolved by remote proxy"
+    fi
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo " Proxified shell active"
     echo " SOCKS5 proxy : ${PROXY_HOST}:${PROXY_PORT}"
-    echo " DNS          : resolved by remote proxy"
+    echo " DNS          : ${dns_label}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -177,13 +291,27 @@ teardown() {
     echo "[*] Done."
 }
 
+# ── Usage ────────────────────────────────────────────────────────────────────
+
 usage() {
-    echo "Usage: sudo proxy-shell <host:port> [command]"
+    echo "Usage: sudo proxy-shell [options] <host:port> [command]"
     echo ""
     echo "  host:port   SOCKS5 proxy address (e.g. 127.0.0.1:8888)"
     echo "  command     Optional command to run inside the proxified namespace."
     echo "              If omitted, opens an interactive shell — ALL traffic from"
     echo "              every command you run will be transparently proxified."
+    echo ""
+    echo "Options:"
+    echo "  --dns <servers>    Comma-separated DNS servers to use, routed through the proxy."
+    echo "                     Tools see real IPs instead of fake ones. Use when you need"
+    echo "                     real IPs in output or reports. Requires a DNS server"
+    echo "                     reachable through the proxy (e.g. an internal corporate DNS)."
+    echo "                     Example: --dns 10.0.0.53"
+    echo "                              --dns 10.0.0.53,10.0.0.54"
+    echo ""
+    echo "  --local-dns        Resolve DNS using the local machine's resolver, not through"
+    echo "                     the proxy. Tools see real IPs but DNS queries are not tunneled."
+    echo "                     Note: --dns and --local-dns are mutually exclusive."
     echo ""
     echo "  --global-install   Copy this script to /usr/local/bin and check dependencies."
     echo ""
@@ -193,8 +321,13 @@ usage() {
     echo ""
     echo "  # Run a single command through the proxy:"
     echo "  sudo proxy-shell 127.0.0.1:8888 curl https://ifconfig.me"
+    echo ""
+    echo "  # Use a specific DNS server to get real IPs in tool output:"
+    echo "  sudo proxy-shell --dns 10.0.0.53 127.0.0.1:8888"
     exit 1
 }
+
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 if [ $# -eq 0 ]; then
     usage
@@ -206,10 +339,31 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-if [ "${1:-}" = "--global-install" ]; then
-    global_install
-    exit 0
-fi
+# Parse options
+while [[ "${1:-}" == --* ]]; do
+    case "${1}" in
+        --dns)
+            [ -z "${2:-}" ] && { echo "[!] --dns requires an argument."; echo ""; usage; }
+            [ "$LOCAL_DNS" -eq 1 ] && { echo "[!] --dns and --local-dns are mutually exclusive."; echo ""; usage; }
+            PROXY_DNS="${2}"
+            shift 2
+            ;;
+        --local-dns)
+            [ -n "$PROXY_DNS" ] && { echo "[!] --dns and --local-dns are mutually exclusive."; echo ""; usage; }
+            LOCAL_DNS=1
+            shift
+            ;;
+        --global-install)
+            global_install
+            exit 0
+            ;;
+        *)
+            echo "[!] Unknown option: ${1}"
+            echo ""
+            usage
+            ;;
+    esac
+done
 
 # Parse host:port
 PROXY_ADDR="${1}"
@@ -260,7 +414,7 @@ if [ $# -eq 0 ]; then
     cat > "$RCFILE" <<'RCEOF'
 force_color_prompt=yes
 [ -f ~/.bashrc ] && source ~/.bashrc
-PS1='\[\e[38;5;232m\]\[\e[48;5;82m\] proxy-shell \[\e[0m\]\[\e[38;5;82m\]❯\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \$ '
+PS1='\[\e[38;5;232m\]\[\e[48;5;82m\] proxified \[\e[0m\]\[\e[38;5;82m\]❯\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \$ '
 RCEOF
     chown "$SUDO_USER" "$RCFILE"
     ip netns exec "$NS" sudo -u "$SUDO_USER" \
@@ -269,3 +423,4 @@ RCEOF
 else
     ip netns exec "$NS" sudo -u "$SUDO_USER" "$@"
 fi
+

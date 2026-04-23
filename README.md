@@ -60,12 +60,18 @@ This copies the script to `/usr/local/bin` and checks for missing dependencies.
 ## Usage
 
 ```
-sudo proxy-shell <host:port> [command]
+sudo proxy-shell [options] <host:port> [command]
 
   host:port   SOCKS5 proxy address (e.g. 127.0.0.1:8888)
   command     Optional command to run inside the proxified namespace.
               If omitted, opens an interactive shell — ALL traffic from
               every command you run will be transparently proxified.
+
+Options:
+  --dns <servers>    Optional comma-separated DNS servers to use, routed through the proxy.
+
+  --local-dns        Resolve DNS using the local machine's resolver, not through
+                     the proxy.
 
   --global-install   Copy this script to /usr/local/bin and check dependencies.
 ```
@@ -91,6 +97,20 @@ sudo proxy-shell 127.0.0.1:8888 curl https://ifconfig.me
 ```
 
 Runs the command inside the proxified namespace and exits immediately after it finishes.
+
+### Get real IPs in tool output
+
+By default, tools see fake IPs. If you need real IPs — for example when delivering reports to clients — use `--dns` pointing to a DNS server accessible through the proxy:
+
+```bash
+sudo proxy-shell --dns 10.0.0.53 127.0.0.1:8888
+```
+
+If DNS can be resolved locally (public targets, no internal hostnames), use `--local-dns`:
+
+```bash
+sudo proxy-shell --local-dns 127.0.0.1:8888
+```
 
 ### With an SSH tunnel
 
@@ -125,3 +145,4 @@ sudo proxy-shell 127.0.0.1:9999
 
 - **UDP** support depends on your proxy. The tool captures all traffic including UDP, but whether it is forwarded depends on the SOCKS5 proxy implementation. `ssh -D` only supports TCP (`CONNECT`), so UDP will be dropped when using an SSH tunnel. Other SOCKS5 proxies that implement `UDP ASSOCIATE` (RFC 1928) will forward UDP traffic without any changes to this tool.
 - **`sudo` inside the shell** works as expected — commands run with `sudo` are still fully proxified, since child processes inherit the network namespace regardless of user credentials.
+

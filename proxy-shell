@@ -13,8 +13,11 @@ CONF_FILE="/tmp/singbox-${$}.json"
 RCFILE="/tmp/proxy-shell-rc-${$}"
 PROXY_DNS=""                 # --dns: comma-separated DNS servers to use through proxy
 LOCAL_DNS=0                  # --local-dns: resolve DNS locally, not through proxy
+VERBOSE=1                    # 0 when a command is passed inline (non-interactive mode)
 
 set -e
+
+log() { [ "$VERBOSE" -eq 1 ] || return 0; echo "$@"; }
 
 # ── Dependency check ────────────────────────────────────────────────────────
 
@@ -233,10 +236,10 @@ generate_config() {
 # ── Setup / teardown ─────────────────────────────────────────────────────────
 
 setup() {
-    echo "[*] Creating network namespace..."
+    log "[*] Creating network namespace..."
     ip netns add "$NS"
 
-    echo "[*] Starting sing-box..."
+    log "[*] Starting sing-box..."
     generate_config
     # sing-box runs in the HOST namespace: direct access to PROXY_HOST:PROXY_PORT
     sing-box run -c "$CONF_FILE" &>"$LOG_FILE" &
@@ -249,7 +252,7 @@ setup() {
         exit 1
     fi
 
-    echo "[*] Moving TUN into proxy namespace..."
+    log "[*] Moving TUN into proxy namespace..."
     # sing-box keeps its fd valid even after the interface moves to another namespace
     ip link set "$TUN_DEV" netns "$NS"
     ip netns exec "$NS" ip addr add "${TUN_GW}/15" dev "$TUN_DEV"
@@ -257,7 +260,7 @@ setup() {
     ip netns exec "$NS" ip link set lo up
     ip netns exec "$NS" ip route add default dev "$TUN_DEV"
 
-    echo "[*] Configuring namespace DNS..."
+    log "[*] Configuring namespace DNS..."
     mkdir -p /etc/netns/"$NS"
     # Placeholder — sing-box intercepts all DNS on port 53 before it leaves the namespace
     echo "nameserver 8.8.8.8" > /etc/netns/"$NS"/resolv.conf
@@ -271,24 +274,24 @@ setup() {
         dns_label="fake IP — resolved by remote proxy"
     fi
 
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo " Proxified shell active"
-    echo " SOCKS5 proxy : ${PROXY_HOST}:${PROXY_PORT}"
-    echo " DNS          : ${dns_label}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log ""
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log " Proxified shell active"
+    log " SOCKS5 proxy : ${PROXY_HOST}:${PROXY_PORT}"
+    log " DNS          : ${dns_label}"
+    log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 teardown() {
-    echo ""
-    echo "[*] Cleaning up..."
+    log ""
+    log "[*] Cleaning up..."
     kill "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
     ip link del "$TUN_DEV" 2>/dev/null || true
     rm -f "$PID_FILE" "$LOG_FILE" "$CONF_FILE" "$RCFILE"
     rm -f /etc/netns/"$NS"/resolv.conf
     rmdir /etc/netns/"$NS" 2>/dev/null || true
-    echo "[*] Done."
+    log "[*] Done."
 }
 
 # ── Usage ────────────────────────────────────────────────────────────────────
@@ -393,6 +396,7 @@ if ! [[ "$PROXY_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 shift  # remove host:port from "$@"; remaining args are the optional command
+[ $# -gt 0 ] && VERBOSE=0
 
 # Clean up orphaned /etc/netns entries from previous crashed instances
 for dir in /etc/netns/psh-*/; do

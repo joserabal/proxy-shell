@@ -13,6 +13,9 @@ CONF_FILE="/tmp/singbox-${$}.json"
 RCFILE="/tmp/proxy-shell-rc-${$}"
 PROXY_DNS=""                 # --dns: comma-separated DNS servers to use through proxy
 LOCAL_DNS=0                  # --local-dns: resolve DNS locally, not through proxy
+NO_PROXY=""                  # --no-proxy: comma-separated targets that bypass the proxy
+NO_PROXY_DOMAINS=()          # populated from NO_PROXY: hostname/domain entries
+NO_PROXY_CIDRS=()            # populated from NO_PROXY: IP/CIDR entries (always /N)
 VERBOSE=1                    # 0 when a command is passed inline (non-interactive mode)
 
 set -e
@@ -94,6 +97,101 @@ global_install() {
     check_deps
 }
 
+# ── --no-proxy parsing ──────────────────────────────────────────────────────
+
+# Classify each comma-separated entry into NO_PROXY_DOMAINS or NO_PROXY_CIDRS.
+# IPv4 addresses without prefix are normalized to /32.
+classify_no_proxy() {
+    [ -z "$NO_PROXY" ] && return 0
+
+    local entry entries
+    IFS=',' read -ra entries <<< "$NO_PROXY"
+    for entry in "${entries[@]}"; do
+        entry="${entry// /}"
+        [ -z "$entry" ] && continue
+
+        if [[ "$entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+            [[ "$entry" == */* ]] || entry="${entry}/32"
+            NO_PROXY_CIDRS+=("$entry")
+        elif [[ "$entry" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            NO_PROXY_DOMAINS+=("$entry")
+        else
+            echo "[!] Invalid --no-proxy entry: '${entry}'"
+            exit 1
+        fi
+    done
+}
+
+# Resolve every hostname in NO_PROXY_DOMAINS to its IPv4 addresses and append them
+# as /32 CIDRs to NO_PROXY_CIDRS. This pre-resolution is what makes the bypass
+# work for any protocol: route matching happens on the destination IP, so the
+# kernel doesn't need to sniff Host/SNI to recognize the connection. The DNS rule
+# still routes the hostname's queries to np-local so the app receives these same
+# real IPs (rather than fakeip/proxy-resolved ones) and the routing matches.
+resolve_no_proxy_domains() {
+    [ ${#NO_PROXY_DOMAINS[@]} -eq 0 ] && return 0
+
+    local domain ips ip
+    for domain in "${NO_PROXY_DOMAINS[@]}"; do
+        ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+        if [ -z "$ips" ]; then
+            echo "[!] Could not resolve --no-proxy hostname: '${domain}'"
+            exit 1
+        fi
+        while IFS= read -r ip; do
+            [ -n "$ip" ] && NO_PROXY_CIDRS+=("${ip}/32")
+        done <<< "$ips"
+    done
+}
+
+_json_string_array() {
+    local out="[" first=1 v
+    for v in "$@"; do
+        [ $first -eq 0 ] && out+=", "
+        out+="\"${v}\""
+        first=0
+    done
+    out+="]"
+    printf '%s' "$out"
+}
+
+_np_active() {
+    [ ${#NO_PROXY_DOMAINS[@]} -gt 0 ] || [ ${#NO_PROXY_CIDRS[@]} -gt 0 ]
+}
+
+# Extra DNS server entry (with leading comma) used as the resolver for bypassed
+# targets and as the domain_resolver of the direct outbound (required by
+# sing-box 1.12+).
+_np_dns_server_entry() {
+    _np_active || return 0
+    printf ', {"tag": "np-local", "type": "local"}'
+}
+
+# DNS rule (with trailing comma) routing bypassed hostnames to the local resolver.
+# Must come before the catch-all DNS rules.
+_np_dns_rule_prefix() {
+    [ ${#NO_PROXY_DOMAINS[@]} -eq 0 ] && return 0
+    local doms; doms=$(_json_string_array "${NO_PROXY_DOMAINS[@]}")
+    printf '{"domain_suffix": %s, "server": "np-local"}, ' "$doms"
+}
+
+# Route rule (with leading comma) sending bypassed targets to the direct outbound.
+# Hostnames have been pre-resolved into NO_PROXY_CIDRS, so a single ip_cidr rule
+# covers every bypass entry — no domain_suffix matching (which would only work
+# behind protocol sniffing) is needed.
+_np_route_rules_suffix() {
+    [ ${#NO_PROXY_CIDRS[@]} -eq 0 ] && return 0
+    local cidrs; cidrs=$(_json_string_array "${NO_PROXY_CIDRS[@]}")
+    printf ', {"ip_cidr": %s, "outbound": "direct"}' "$cidrs"
+}
+
+# Direct outbound entry (with leading comma). The explicit domain_resolver
+# silences the sing-box 1.12+ deprecation that becomes fatal otherwise.
+_np_outbound_entry() {
+    _np_active || return 0
+    printf ', {"type": "direct", "tag": "direct", "domain_resolver": "np-local"}'
+}
+
 # ── Config generation ────────────────────────────────────────────────────────
 
 # Default mode: fake IP DNS — hostnames resolved by the remote proxy.
@@ -106,9 +204,9 @@ _gen_fakeip_config() {
   "dns": {
     "servers": [
       {"tag": "fp",     "type": "fakeip", "inet4_range": "${FAKE_RANGE}"},
-      {"tag": "remote", "type": "tcp",    "server": "8.8.8.8", "detour": "proxy"}
+      {"tag": "remote", "type": "tcp",    "server": "8.8.8.8", "detour": "proxy"}$(_np_dns_server_entry)
     ],
-    "rules": [{"query_type": ["A", "AAAA"], "server": "fp"}],
+    "rules": [$(_np_dns_rule_prefix){"query_type": ["A", "AAAA"], "server": "fp"}],
     "final": "remote"
   },
   "inbounds": [{
@@ -125,9 +223,9 @@ _gen_fakeip_config() {
     "server": "${PROXY_HOST}",
     "server_port": ${PROXY_PORT},
     "version": "5"
-  }],
+  }$(_np_outbound_entry)],
   "route": {
-    "rules": [{"port": 53, "action": "hijack-dns"}],
+    "rules": [{"port": 53, "action": "hijack-dns"}$(_np_route_rules_suffix)],
     "final": "proxy"
   }
 }
@@ -156,9 +254,9 @@ _gen_proxy_dns_config() {
   "log": {"level": "warn"},
   "dns": {
     "servers": [
-      ${servers_json}
+      ${servers_json}$(_np_dns_server_entry)
     ],
-    "rules": [{"query_type": ["A", "AAAA"], "server": "remote-0"}],
+    "rules": [$(_np_dns_rule_prefix){"query_type": ["A", "AAAA"], "server": "remote-0"}],
     "final": "remote-0"
   },
   "inbounds": [{
@@ -175,9 +273,9 @@ _gen_proxy_dns_config() {
     "server": "${PROXY_HOST}",
     "server_port": ${PROXY_PORT},
     "version": "5"
-  }],
+  }$(_np_outbound_entry)],
   "route": {
-    "rules": [{"port": 53, "action": "hijack-dns"}],
+    "rules": [{"port": 53, "action": "hijack-dns"}$(_np_route_rules_suffix)],
     "final": "proxy"
   }
 }
@@ -194,9 +292,9 @@ _gen_local_dns_config() {
   "log": {"level": "warn"},
   "dns": {
     "servers": [
-      {"tag": "local", "type": "local"}
+      {"tag": "local", "type": "local"}$(_np_dns_server_entry)
     ],
-    "rules": [{"query_type": ["A", "AAAA"], "server": "local"}],
+    "rules": [$(_np_dns_rule_prefix){"query_type": ["A", "AAAA"], "server": "local"}],
     "final": "local"
   },
   "inbounds": [{
@@ -213,9 +311,9 @@ _gen_local_dns_config() {
     "server": "${PROXY_HOST}",
     "server_port": ${PROXY_PORT},
     "version": "5"
-  }],
+  }$(_np_outbound_entry)],
   "route": {
-    "rules": [{"port": 53, "action": "hijack-dns"}],
+    "rules": [{"port": 53, "action": "hijack-dns"}$(_np_route_rules_suffix)],
     "final": "proxy"
   }
 }
@@ -279,6 +377,9 @@ setup() {
     log " Proxified shell active"
     log " SOCKS5 proxy : ${PROXY_HOST}:${PROXY_PORT}"
     log " DNS          : ${dns_label}"
+    if [ ${#NO_PROXY_DOMAINS[@]} -gt 0 ] || [ ${#NO_PROXY_CIDRS[@]} -gt 0 ]; then
+        log " No-proxy     : ${NO_PROXY_DOMAINS[*]} ${NO_PROXY_CIDRS[*]}"
+    fi
     log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
@@ -316,6 +417,15 @@ usage() {
     echo "                     the proxy. Tools see real IPs but DNS queries are not tunneled."
     echo "                     Note: --dns and --local-dns are mutually exclusive."
     echo ""
+    echo "  --no-proxy <list>  Comma-separated targets that bypass the proxy and connect"
+    echo "                     directly. Accepts hostnames, IPv4 addresses, and CIDR ranges."
+    echo "                     Hostnames are resolved at startup and bypass is matched on the"
+    echo "                     resulting IPs (works for any protocol — TCP, UDP, raw sockets)."
+    echo "                     Requires --dns or --local-dns: in the default fakeip mode the"
+    echo "                     client only sees fake IPs, so IP-based route matching cannot"
+    echo "                     identify bypassed targets."
+    echo "                     Example: --no-proxy example.com,10.0.0.0/8,192.168.1.1"
+    echo ""
     echo "  --global-install   Copy this script to /usr/local/bin and check dependencies."
     echo ""
     echo "Examples:"
@@ -327,6 +437,9 @@ usage() {
     echo ""
     echo "  # Use a specific DNS server to get real IPs in tool output:"
     echo "  sudo proxy-shell --dns 10.0.0.53 127.0.0.1:8888"
+    echo ""
+    echo "  # Bypass the proxy for a corporate network and a specific host:"
+    echo "  sudo proxy-shell --local-dns --no-proxy 10.0.0.0/8,internal.corp 127.0.0.1:8888"
     exit 1
 }
 
@@ -356,6 +469,11 @@ while [[ "${1:-}" == --* ]]; do
             LOCAL_DNS=1
             shift
             ;;
+        --no-proxy)
+            [ -z "${2:-}" ] && { echo "[!] --no-proxy requires an argument."; echo ""; usage; }
+            NO_PROXY="${2}"
+            shift 2
+            ;;
         --global-install)
             global_install
             exit 0
@@ -367,6 +485,17 @@ while [[ "${1:-}" == --* ]]; do
             ;;
     esac
 done
+
+# --no-proxy needs real IPs at the kernel level for IP-based route matching to
+# work. The default fakeip mode delivers fake IPs (198.18.0.0/15) to clients,
+# so the kernel never sees the bypass IPs and the route rule never matches.
+if [ -n "$NO_PROXY" ] && [ -z "$PROXY_DNS" ] && [ "$LOCAL_DNS" -eq 0 ]; then
+    echo "[!] --no-proxy requires --dns or --local-dns."
+    echo "    The default fakeip mode delivers fake IPs to the client, so IP-based"
+    echo "    bypass routing cannot match the real destination addresses."
+    echo ""
+    usage
+fi
 
 # Parse host:port
 PROXY_ADDR="${1}"
@@ -407,6 +536,9 @@ for dir in /etc/netns/psh-*/; do
         rmdir "$dir" 2>/dev/null || true
     fi
 done
+
+classify_no_proxy
+resolve_no_proxy_domains
 
 check_deps
 

@@ -73,6 +73,10 @@ Options:
   --local-dns        Resolve DNS using the local machine's resolver, not through
                      the proxy.
 
+  --no-proxy <list>  Comma-separated targets that bypass the proxy and connect
+                     directly. Accepts hostnames, IPv4 addresses, and CIDR ranges.
+                     Requires --dns or --local-dns.
+
   --global-install   Copy this script to /usr/local/bin and check dependencies.
 ```
 
@@ -111,6 +115,16 @@ If DNS can be resolved locally (public targets, no internal hostnames), use `--l
 ```bash
 sudo proxy-shell --local-dns 127.0.0.1:8888
 ```
+
+### Bypass the proxy for specific targets
+
+Use `--no-proxy` to define exceptions that connect directly instead of going through the proxy. The list is comma-separated and accepts hostnames, IPv4 addresses, and CIDR ranges in any combination:
+
+```bash
+sudo proxy-shell --local-dns --no-proxy example.com,10.0.0.0/8,192.168.1.1 127.0.0.1:8888
+```
+
+`--no-proxy` requires `--dns` or `--local-dns`. The default fakeip mode delivers fake IPs (`198.18.0.0/15`) to the client, so the kernel never sees the real destination IPs and IP-based bypass routing cannot match. Real-IP DNS modes are needed for the bypass set to line up with what the client actually connects to.
 
 ### With an SSH tunnel
 

@@ -546,10 +546,33 @@ trap teardown EXIT
 
 setup
 
+# Use the user's login shell so their profile chain sets PATH/env as in a
+# normal terminal. Fish doesn't support the `exec "$@"` idiom — fall back to bash.
+USER_SHELL=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f7)
+[ -x "$USER_SHELL" ] || USER_SHELL=/bin/bash
+case "$USER_SHELL" in
+    */fish) USER_SHELL=/bin/bash ;;
+esac
+
 if [ $# -eq 0 ]; then
+    # Replicate login init from the rcfile (bash --rcfile is non-login) and
+    # guard against ~/.profile chaining to ~/.bashrc and sourcing it twice.
     cat > "$RCFILE" <<'RCEOF'
+__psh_source() {
+    [ -f "$1" ] || return
+    case ":$__psh_sourced:" in *":$1:"*) return ;; esac
+    __psh_sourced="${__psh_sourced}:$1"
+    . "$1"
+}
+__psh_source /etc/profile
+for __psh_f in ~/.bash_profile ~/.bash_login ~/.profile; do
+    [ -f "$__psh_f" ] && { __psh_source "$__psh_f"; break; }
+done
+__psh_source ~/.bashrc
+unset -f __psh_source
+unset __psh_sourced __psh_f
+
 force_color_prompt=yes
-[ -f ~/.bashrc ] && source ~/.bashrc
 PS1='\[\e[38;5;232m\]\[\e[48;5;82m\] proxified \[\e[0m\]\[\e[38;5;82m\]❯\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \$ '
 RCEOF
     chown "$SUDO_USER" "$RCFILE"
@@ -557,6 +580,10 @@ RCEOF
         env TERM="${TERM:-xterm-256color}" \
         bash --rcfile "$RCFILE"
 else
-    ip netns exec "$NS" sudo -u "$SUDO_USER" "$@"
+    # -i bypasses ~/.bashrc's early-return for non-interactive shells (which
+    # would drop pnpm/asdf/etc.); `exec "$@"` preserves argv (no shell -c
+    # re-parsing).
+    ip netns exec "$NS" sudo -u "$SUDO_USER" \
+        "$USER_SHELL" -li -c 'exec "$@"' _ "$@"
 fi
 

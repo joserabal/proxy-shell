@@ -582,8 +582,16 @@ RCEOF
 else
     # -i bypasses ~/.bashrc's early-return for non-interactive shells (which
     # would drop pnpm/asdf/etc.); `exec "$@"` preserves argv (no shell -c
-    # re-parsing).
+    # re-parsing). The fd dance silences bash's cosmetic job-control warnings
+    # when invoked without a controlling TTY (cron, agents, subprocess, ...):
+    # a non-interactive bash (no warnings itself) opens fd 3 = real stderr and
+    # redirects fd 2 = /dev/null, then execs the interactive bash whose -c body
+    # restores fd 2 from fd 3 before running the user's command. The fd 3 trick
+    # has to happen post-sudo because sudo closes fds > 2.
     ip netns exec "$NS" sudo -u "$SUDO_USER" \
-        "$USER_SHELL" -li -c 'exec "$@"' _ "$@"
+        bash -c '
+            shell="$1"; shift
+            exec "$shell" -li -c "exec 2>&3 3>&-; exec \"\$@\"" _ "$@" 3>&2 2>/dev/null
+        ' _ "$USER_SHELL" "$@"
 fi
 

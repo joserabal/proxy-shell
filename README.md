@@ -43,6 +43,7 @@ A different approach is to set environment variables like `http_proxy` / `https_
 - `iproute2`
 - [`sing-box`](https://github.com/SagerNet/sing-box)
 - `curl`
+- `iptables`
 
 Missing dependencies are detected automatically at startup, with an option to install them interactively.
 
@@ -75,7 +76,7 @@ Options:
 
   --no-proxy <list>  Comma-separated targets that bypass the proxy and connect
                      directly. Accepts hostnames, IPv4 addresses, and CIDR ranges.
-                     Requires --dns or --local-dns.
+                     Loopback addresses (127.0.0.0/8) are supported too.
 
   --global-install   Copy this script to /usr/local/bin and check dependencies.
 ```
@@ -121,10 +122,15 @@ sudo proxy-shell --local-dns 127.0.0.1:8888
 Use `--no-proxy` to define exceptions that connect directly instead of going through the proxy. The list is comma-separated and accepts hostnames, IPv4 addresses, and CIDR ranges in any combination:
 
 ```bash
-sudo proxy-shell --local-dns --no-proxy example.com,10.0.0.0/8,192.168.1.1 127.0.0.1:8888
+sudo proxy-shell --no-proxy example.com,10.0.0.0/8,192.168.1.1 127.0.0.1:8888
 ```
 
-`--no-proxy` requires `--dns` or `--local-dns`. The default fakeip mode delivers fake IPs (`198.18.0.0/15`) to the client, so the kernel never sees the real destination IPs and IP-based bypass routing cannot match. Real-IP DNS modes are needed for the bypass set to line up with what the client actually connects to.
+Loopback addresses are supported too, which is useful for chaining a local intercepting proxy (e.g. Burp Suite, mitmproxy) on top of the SOCKS proxy:
+
+```bash
+sudo proxy-shell --no-proxy 127.0.0.1 127.0.0.1:8888 \
+     bash -c 'http_proxy=http://127.0.0.1:8080 curl https://ifconfig.me'
+```
 
 ### With an SSH tunnel
 

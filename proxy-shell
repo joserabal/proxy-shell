@@ -23,6 +23,9 @@ NO_PROXY=""                  # --no-proxy: comma-separated targets that bypass t
 NO_PROXY_DOMAINS=()          # populated from NO_PROXY: hostname/domain entries
 NO_PROXY_CIDRS=()            # populated from NO_PROXY: IP/CIDR entries (always /N)
 VERBOSE=1                    # 0 when a command is passed inline (non-interactive mode)
+KEEP_ENV=0                   # --keep-env: run the inline command with the current environment
+NAT_RULES=0                  # 1 once the host-side forwarding rules are installed
+TUN_TIMEOUT=30               # failure threshold waiting for sing-box to create the TUN
 
 set -e
 
@@ -189,6 +192,15 @@ _np_has_loopback() {
     local cidr
     for cidr in "${NO_PROXY_CIDRS[@]}"; do
         [[ "$cidr" =~ ^127\. ]] && return 0
+    done
+    return 1
+}
+
+# Returns 0 if any bypassed CIDR falls outside 127.0.0.0/8.
+_np_has_non_loopback() {
+    local cidr
+    for cidr in "${NO_PROXY_CIDRS[@]}"; do
+        [[ "$cidr" =~ ^127\. ]] || return 0
     done
     return 1
 }
@@ -372,15 +384,51 @@ setup_no_proxy_bypass() {
         ip netns exec "$NS" ip route add "$cidr" via "$VETH_HOST_IP" dev "$VETH_NS"
     done
 
-    # Host side: enable forwarding and SNAT so reply traffic for non-loopback
+    # Host side: forwarding and SNAT so reply traffic for non-loopback
     # destinations finds its way back through the veth. Loopback delivery is
-    # local INPUT and doesn't need either, but enabling them unconditionally
-    # is harmless and keeps the rule set uniform.
-    sysctl -qw net.ipv4.ip_forward=1
-    iptables -t nat -A POSTROUTING -s "${VETH_NS_IP}/32" ! -d 127.0.0.0/8 \
-        -m comment --comment "psh-${$}" -j MASQUERADE
-    iptables -A FORWARD -i "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT
-    iptables -A FORWARD -o "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT
+    # local INPUT and needs neither, so a loopback-only bypass skips them.
+    if _np_has_non_loopback; then
+        NAT_RULES=1
+        sysctl -qw net.ipv4.ip_forward=1
+        iptables -t nat -A POSTROUTING -s "${VETH_NS_IP}/32" ! -d 127.0.0.0/8 \
+            -m comment --comment "psh-${$}" -j MASQUERADE
+        iptables -A FORWARD -i "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT
+        iptables -A FORWARD -o "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT
+    fi
+}
+
+# Blocks until sing-box has finished bringing the TUN device up, which is its
+# last action on the interface: moving the device any earlier makes its
+# post-start lookup fail and sing-box dies. TUN_TIMEOUT is a failure threshold,
+# not a wait margin.
+wait_for_tun() {
+    local sb_pid deadline flags dev_flags
+    sb_pid=$(cat "$PID_FILE")
+    deadline=$(( SECONDS + TUN_TIMEOUT ))
+    dev_flags="/sys/class/net/${TUN_DEV}/flags"
+
+    while :; do
+        # Guarded rather than redirected: a failing redirection is reported by
+        # the shell itself, and the command's own 2>/dev/null does not mute it.
+        flags=""
+        if [ -r "$dev_flags" ]; then
+            read -r flags < "$dev_flags" || flags=""
+        fi
+        if [ -n "$flags" ] && (( flags & 1 )); then    # IFF_UP
+            return 0
+        fi
+        if ! kill -0 "$sb_pid" 2>/dev/null; then
+            echo "[!] sing-box failed to start:"
+            cat "$LOG_FILE"
+            exit 1
+        fi
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "[!] Timed out after ${TUN_TIMEOUT}s waiting for TUN device '${TUN_DEV}':"
+            cat "$LOG_FILE"
+            exit 1
+        fi
+        sleep 0.01
+    done
 }
 
 setup() {
@@ -393,12 +441,7 @@ setup() {
     sing-box run -c "$CONF_FILE" &>"$LOG_FILE" &
     echo $! > "$PID_FILE"
 
-    sleep 1
-    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "[!] sing-box failed to start:"
-        cat "$LOG_FILE"
-        exit 1
-    fi
+    wait_for_tun
 
     log "[*] Moving TUN into proxy namespace..."
     # sing-box keeps its fd valid even after the interface moves to another namespace
@@ -439,10 +482,12 @@ teardown() {
     log ""
     log "[*] Cleaning up..."
     kill "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -s "${VETH_NS_IP}/32" ! -d 127.0.0.0/8 \
-        -m comment --comment "psh-${$}" -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -i "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -o "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT 2>/dev/null || true
+    if [ "$NAT_RULES" -eq 1 ]; then
+        iptables -t nat -D POSTROUTING -s "${VETH_NS_IP}/32" ! -d 127.0.0.0/8 \
+            -m comment --comment "psh-${$}" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -o "$VETH_HOST" -m comment --comment "psh-${$}" -j ACCEPT 2>/dev/null || true
+    fi
     ip netns del "$NS" 2>/dev/null || true
     ip link del "$TUN_DEV" 2>/dev/null || true
     ip link del "$VETH_HOST" 2>/dev/null || true
@@ -482,6 +527,12 @@ usage() {
     echo "                     so loopback addresses (127.0.0.0/8) work too — useful for chaining"
     echo "                     a local interception proxy (e.g. Burp on 127.0.0.1:8080) on top."
     echo "                     Example: --no-proxy example.com,10.0.0.0/8,127.0.0.1"
+    echo ""
+    echo "  --keep-env         Run the inline command with proxy-shell's own environment"
+    echo "                     instead of rebuilding it from the login profiles. Skips the"
+    echo "                     login shell, so startup is faster, but the caller is then"
+    echo "                     responsible for passing a usable environment (PATH included)"
+    echo "                     through, e.g. 'sudo -E'. Ignored in interactive mode."
     echo ""
     echo "  --global-install   Copy this script to /usr/local/bin and check dependencies."
     echo ""
@@ -535,6 +586,10 @@ while [[ "${1:-}" == --* ]]; do
             NO_PROXY="${2}"
             shift 2
             ;;
+        --keep-env)
+            KEEP_ENV=1
+            shift
+            ;;
         --global-install)
             global_install
             exit 0
@@ -546,6 +601,17 @@ while [[ "${1:-}" == --* ]]; do
             ;;
     esac
 done
+
+if [ "$KEEP_ENV" -eq 1 ]; then
+    if [ -z "$SUDO_UID" ] || [ -z "$SUDO_GID" ]; then
+        echo "[!] --keep-env requires invoking proxy-shell through sudo (SUDO_UID/SUDO_GID unset)."
+        exit 1
+    fi
+    if ! command -v setpriv &>/dev/null; then
+        echo "[!] --keep-env requires setpriv (util-linux)."
+        exit 1
+    fi
+fi
 
 # Parse host:port
 PROXY_ADDR="${1}"
@@ -650,6 +716,11 @@ RCEOF
     ip netns exec "$NS" sudo -u "$SUDO_USER" \
         env TERM="${TERM:-xterm-256color}" \
         bash --rcfile "$RCFILE"
+elif [ "$KEEP_ENV" -eq 1 ]; then
+    # setpriv drops to the invoking user without touching the environment, so
+    # the command runs with exactly the one proxy-shell received.
+    ip netns exec "$NS" \
+        setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- "$@"
 else
     # -i bypasses ~/.bashrc's early-return for non-interactive shells (which
     # would drop pnpm/asdf/etc.); `exec "$@"` preserves argv (no shell -c

@@ -44,6 +44,7 @@ A different approach is to set environment variables like `http_proxy` / `https_
 - [`sing-box`](https://github.com/SagerNet/sing-box)
 - `curl`
 - `iptables`
+- `util-linux` (only for `--keep-env`)
 
 Missing dependencies are detected automatically at startup, with an option to install them interactively.
 
@@ -77,6 +78,9 @@ Options:
   --no-proxy <list>  Comma-separated targets that bypass the proxy and connect
                      directly. Accepts hostnames, IPv4 addresses, and CIDR ranges.
                      Loopback addresses (127.0.0.0/8) are supported too.
+
+  --keep-env         Run the inline command with proxy-shell's own environment
+                     instead of rebuilding it from the login profiles.
 
   --global-install   Copy this script to /usr/local/bin and check dependencies.
 ```
@@ -131,6 +135,23 @@ Loopback addresses are supported too, which is useful for chaining a local inter
 sudo proxy-shell --no-proxy 127.0.0.1 127.0.0.1:8888 \
      bash -c 'http_proxy=http://127.0.0.1:8080 curl https://ifconfig.me'
 ```
+
+### Run a command without rebuilding the environment
+
+By default, an inline command runs through a login shell so it sees the same
+`PATH` and shell setup you get in a terminal. `--keep-env` skips that and runs the
+command with the environment `proxy-shell` itself received, which cuts the startup
+cost. The caller then owns the environment, so pass it through with `sudo -E`:
+
+```bash
+sudo -E proxy-shell --keep-env 127.0.0.1:8888 curl https://ifconfig.me
+```
+
+Preserving the environment across `sudo` needs the `SETENV` tag in your sudoers
+entry. Without it the command runs with sudo's sanitized `PATH`, and tools
+installed outside the system directories (`~/go/bin`, `nvm`, `asdf`) will not be
+found. It applies to the inline command form only; interactive shells always use
+the login profiles.
 
 ### With an SSH tunnel
 

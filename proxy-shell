@@ -175,7 +175,30 @@ _np_active() {
 # sing-box 1.12+).
 _np_dns_server_entry() {
     _np_active || return 0
-    printf ', {"tag": "np-local", "type": "local"}'
+    printf ', %s' "$(_local_dns_server_json np-local)"
+}
+
+# True if the installed sing-box is at least $1 (e.g. "_singbox_ge 1.13.0").
+_singbox_ge() {
+    local ver
+    ver=$(sing-box version 2>/dev/null | awk 'NR==1 && $2 == "version" {print $3; exit}')
+    [ -n "$ver" ] && [ "$(printf '%s\n%s\n' "$ver" "$1" | sort -V | tail -n1)" = "$ver" ]
+}
+
+# "Local" DNS server entry. Since 1.13.0, sing-box's "type":"local" resolves
+# through a systemd-resolved D-Bus integration (a documented "platform-specific
+# optimization") that later 1.13.x patches made bind its queries to the default
+# interface. On hosts whose policy routing drops interface-bound UDP replies
+# (Tailscale's fwmark rules here), every lookup then times out with no reply.
+# prefer_go is sing-box's documented switch to disable that integration — added
+# in 1.13.0 and functional there, but an unknown (fatal) field on 1.12.x, where
+# "local" is simply the Go resolver and the plain form is correct.
+_local_dns_server_json() {
+    if _singbox_ge 1.13.0; then
+        printf '{"tag": "%s", "type": "local", "prefer_go": true}' "$1"
+    else
+        printf '{"tag": "%s", "type": "local"}' "$1"
+    fi
 }
 
 # DNS rule (with trailing comma) routing bypassed hostnames to the local resolver.
@@ -305,7 +328,7 @@ _gen_local_dns_config() {
   "log": {"level": "warn"},
   "dns": {
     "servers": [
-      {"tag": "local", "type": "local"}$(_np_dns_server_entry)
+      $(_local_dns_server_json local)$(_np_dns_server_entry)
     ],
     "rules": [$(_np_dns_rule_prefix){"query_type": ["A", "AAAA"], "server": "local"}],
     "final": "local"

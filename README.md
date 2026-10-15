@@ -185,5 +185,6 @@ sudo proxy-shell 127.0.0.1:9999
 ## Notes
 
 - **UDP** support depends on your proxy. The tool captures all traffic including UDP, but whether it is forwarded depends on the SOCKS5 proxy implementation. `ssh -D` only supports TCP (`CONNECT`), so UDP will be dropped when using an SSH tunnel. Other SOCKS5 proxies that implement `UDP ASSOCIATE` (RFC 1928) will forward UDP traffic without any changes to this tool.
+- **`--local-dns`** uses sing-box's `local` DNS server type on 1.12.x and adds `prefer_go` on sing-box ≥ 1.13.0. From 1.13 on, `local` resolves through a systemd-resolved D-Bus integration that binds its queries to the default interface; on hosts where policy routing drops interface-bound UDP replies (e.g. with Tailscale installed), every lookup would time out. `prefer_go` is sing-box's documented switch to disable that integration.
 - **`sudo` inside the shell** works as expected — commands run with `sudo` are still fully proxified, since child processes inherit the network namespace regardless of user credentials.
 
